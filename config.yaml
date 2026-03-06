@@ -1,0 +1,44 @@
+steam:
+  app_id: 1422450
+  depot_id: 1422456
+  branch: "public"
+  # How often to check for updates (seconds)
+  poll_interval_seconds: 300
+
+output:
+  vpk_name: "pak01_dir.vpk"
+  staging_dir: "/app/staging"
+  output_dir: "/app/output"
+  depot_cache_dir: "/app/data/depot_cache"
+
+state:
+  file: "/app/data/state.json"
+
+# Path to the source VPK within the Steam depot
+source_vpk_path: "game/citadel/pak01_dir.vpk"
+
+# Path to steam.inf for version checking (lightweight manifest check)
+steam_inf_path: "game/citadel/steam.inf"
+
+# Files packed inside pak01_dir.vpk
+# Use the actual compiled extensions (_c suffix)
+tracked_vpk_files:
+  - "scripts/abilities.vdata_c"
+  - "scripts/heros.vdata_c"
+  - "panorama/styles/popups/panorama/styles/popups/citadel_popup_roster_select.vcss_c"
+
+# Loose files in the game directory (not inside a VPK)
+# Paths are relative to game/citadel/
+loose_content_prefix: "game/citadel"
+tracked_loose_files:
+  - "resource/localization/citadel_gc_hero_names/*.txt"
+  - "resource/localization/citadel_gc_mod_names/*.txt"
+
+logging:
+  level: "INFO"
+  format: "structured"
+
+gamebanana:
+  enabled: false
+  mod_id: 000000
+  section: "Mods"

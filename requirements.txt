@@ -1,0 +1,4 @@
+requests>=2.31.0
+pyyaml>=6.0.1
+vpk>=1.4.0
+beautifulsoup4>=4.12.0
