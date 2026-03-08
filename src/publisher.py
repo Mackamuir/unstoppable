@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,9 +40,41 @@ class GameBananaPublisher:
             ),
         })
 
+    def _request(self, method, url, max_retries=5, base_delay=10.0, max_delay=120.0, **kwargs):
+        """HTTP request with exponential backoff retry on transient 5xx/connection errors."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = self.session.request(method, url, **kwargs)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt == max_retries:
+                    raise
+                delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                logger.warning(
+                    "%s %s attempt %d/%d connection error: %s (retrying in %.0fs)",
+                    method.upper(), url, attempt, max_retries, e, delay,
+                )
+                time.sleep(delay)
+                continue
+
+            if resp.status_code < 500:
+                return resp
+
+            if attempt == max_retries:
+                resp.raise_for_status()
+
+            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+            logger.warning(
+                "%s %s attempt %d/%d returned %d (retrying in %.0fs)",
+                method.upper(), url, attempt, max_retries, resp.status_code, delay,
+            )
+            time.sleep(delay)
+
     def authenticate(self):
         """Authenticate with GameBanana API."""
-        resp = self.session.post(
+        self.session.headers.pop("Authorization", None)
+        self.session.cookies.clear()
+        resp = self._request(
+            "POST",
             f"{GB_API_BASE}/Member/Authenticate",
             json={"_sUsername": self.username, "_sPassword": self.password},
         )
@@ -57,7 +90,7 @@ class GameBananaPublisher:
     def _get_sdpid(self) -> str:
         """Scrape the edit page to get the session-specific upload token (sdpid)."""
         edit_url = f"{GB_BASE}/mods/edit/{self.mod_id}"
-        resp = self.session.get(edit_url, headers={"accept": "text/html"})
+        resp = self._request("GET", edit_url, headers={"accept": "text/html"})
         resp.raise_for_status()
 
         html = resp.text
@@ -88,7 +121,8 @@ class GameBananaPublisher:
                 end = offset + len(chunk) - 1
                 chunk_num += 1
 
-                resp = self.session.post(
+                resp = self._request(
+                    "POST",
                     GB_UPLOAD_URL,
                     headers={
                         "content-range": f"bytes {offset}-{end}/{total_size}",
@@ -144,7 +178,8 @@ class GameBananaPublisher:
 
     def _scrape_edit_page(self) -> dict:
         """GET the edit page and scrape the per-session dynamic fields."""
-        resp = self.session.get(
+        resp = self._request(
+            "GET",
             f"{GB_BASE}/mods/edit/{self.mod_id}",
             headers={"accept": "text/html"},
         )
@@ -271,7 +306,7 @@ class GameBananaPublisher:
             ("32d8cec05b843d92bee09510f144eb19", "0"),
             ("d162a5c2c22c71f7b9ebc56a5efe8f41", "false"),
             ("7e09d546d64d500c1d5274a47706a3f6", ""),
-            ("d7064f4f22bfe5c9bc9c0d94caaeed8a", "2"),
+            ("d7064f4f22bfe5c9bc9c0d94caaeed8a", "0"),
             ("185dfdab81e59e022af595b215971f60", "false"),
             ("2010d19c27afbf21f0ccd49e1b90ebd4", "true"),
             ("c8c14dd301e119ca29f9a867fcfd41ae", "false"),
@@ -282,7 +317,8 @@ class GameBananaPublisher:
             ("FormName", "69814328ca00a"),
         ]
 
-        resp = self.session.post(
+        resp = self._request(
+            "POST",
             f"{GB_BASE}/mods/edit/{self.mod_id}",
             data=form,
             headers={
@@ -307,7 +343,8 @@ class GameBananaPublisher:
     def post_failure_warning(self, version: str):
         """Post a warning update to GameBanana when an update cycle fails."""
         self.authenticate()
-        resp = self.session.post(
+        resp = self._request(
+            "POST",
             f"{GB_API_BASE}/{self.section}/{self.mod_id}/Update",
             json={
                 "_aFileRowIds": [],
@@ -337,7 +374,8 @@ class GameBananaPublisher:
         if not changelog:
             changelog = [{"text": f"Auto-update for build {version}", "cat": "Addition"}]
 
-        resp = self.session.post(
+        resp = self._request(
+            "POST",
             f"{GB_API_BASE}/{self.section}/{self.mod_id}/Update",
             json={
                 "_aFileRowIds": [upload.file_row_id],

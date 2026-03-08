@@ -1,5 +1,4 @@
 import logging
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -30,14 +29,13 @@ class SteamDownloader:
         self.username = username
         self.password = password
 
-    def _build_base_cmd(self, download_dir: str, filelist_path: str) -> list[str]:
+    def _build_base_cmd(self, download_dir: str) -> list[str]:
         cmd = [
             DEPOT_DOWNLOADER_CMD,
             "-app", str(self.app_id),
             "-depot", str(self.depot_id),
             "-branch", self.branch,
             "-dir", download_dir,
-            "-filelist", filelist_path,
             "-max-downloads", "8",
         ]
         if self.username:
@@ -60,59 +58,35 @@ class SteamDownloader:
             )
         return result.stdout
 
-    @retry(max_attempts=2, base_delay=5.0, exceptions=(subprocess.CalledProcessError, OSError))
-    def check_build_id(self, download_dir: str, steam_inf_path: str) -> str:
-        """Download steam.inf and parse the build ID for version checking."""
-        dl_path = Path(download_dir)
-        dl_path.mkdir(parents=True, exist_ok=True)
+    @retry(max_attempts=2, base_delay=10.0, exceptions=(subprocess.CalledProcessError, OSError))
+    def download_depot(self, depot_dir: str):
+        """Download or update the entire depot. DepotDownloader handles incremental updates."""
+        Path(depot_dir).mkdir(parents=True, exist_ok=True)
+        cmd = self._build_base_cmd(depot_dir)
+        cmd.append("-validate")
+        self._run_depot_downloader(cmd, timeout=1800)
+        logger.info("Depot download complete: %s", depot_dir)
 
-        filelist = dl_path / "_filelist_inf.txt"
-        filelist.write_text(steam_inf_path + "\n")
-
-        cmd = self._build_base_cmd(str(dl_path), str(filelist))
-        self._run_depot_downloader(cmd, timeout=180)
-
-        inf_file = dl_path / steam_inf_path
+    def get_build_id(self, depot_dir: str, steam_inf_path: str) -> str:
+        """Read build ID from the already-downloaded steam.inf."""
+        inf_file = Path(depot_dir) / steam_inf_path
         if not inf_file.exists():
             raise FileNotFoundError(f"steam.inf not found: {inf_file}")
 
         content = inf_file.read_text()
         if not content.strip():
-            raise OSError("steam.inf downloaded but is empty - chunk download likely failed")
-        # Parse PatchVersion or ClientVersion from steam.inf
+            raise OSError("steam.inf exists but is empty")
+
         for line in content.splitlines():
             if line.startswith("PatchVersion=") or line.startswith("ClientVersion="):
                 build_id = line.split("=", 1)[1].strip()
                 logger.info("Current build: %s", build_id)
                 return build_id
 
-        # Fallback: use the full content hash as build ID
         import hashlib
         build_id = hashlib.sha256(content.encode()).hexdigest()[:16]
         logger.warning("Could not parse version from steam.inf, using hash: %s", build_id)
         return build_id
-
-    @retry(max_attempts=2, base_delay=10.0, exceptions=(subprocess.CalledProcessError, OSError))
-    def download_vpk(self, download_dir: str, source_vpk_path: str) -> Path:
-        """Download pak01_dir.vpk and all its data archives from the depot."""
-        dl_path = Path(download_dir)
-        dl_path.mkdir(parents=True, exist_ok=True)
-
-        filelist = dl_path / "_filelist_vpk.txt"
-        # Match all pak01 VPK parts (dir + data archives)
-        vpk_base = source_vpk_path.replace("_dir.vpk", "")
-        filelist.write_text(f"regex:{re.escape(vpk_base)}_.*\\.vpk\n")
-
-        cmd = self._build_base_cmd(str(dl_path), str(filelist))
-        self._run_depot_downloader(cmd, timeout=600)
-
-        vpk_path = dl_path / source_vpk_path
-        if not vpk_path.exists():
-            raise FileNotFoundError(f"VPK not found after download: {vpk_path}")
-
-        size_mb = vpk_path.stat().st_size / 1048576
-        logger.info("VPK downloaded: %s (%.1f MB)", vpk_path, size_mb)
-        return vpk_path
 
     def extract_vpk_files(
         self,
@@ -127,14 +101,7 @@ class SteamDownloader:
         extract_path = Path(extract_dir)
         extract_path.mkdir(parents=True, exist_ok=True)
 
-        try:
-            pak = vpklib.open(str(vpk_path))
-        except ValueError as e:
-            logger.warning("Corrupted VPK (invalid magic), deleting for redownload: %s", vpk_path)
-            vpk_base = vpk_path.name.replace("_dir.vpk", "")
-            for sibling in vpk_path.parent.glob(f"{vpk_base}*.vpk"):
-                sibling.unlink(missing_ok=True)
-            raise OSError("Corrupted VPK deleted, redownload required") from e
+        pak = vpklib.open(str(vpk_path))
         extracted = []
 
         for file_path in pak:
@@ -148,37 +115,22 @@ class SteamDownloader:
         logger.info("Extracted %d files from VPK", len(extracted))
         return extracted
 
-    @retry(max_attempts=2, base_delay=10.0, exceptions=(subprocess.CalledProcessError, OSError))
-    def download_loose_files(
+    def collect_loose_files(
         self,
-        patterns: list[str],
+        depot_dir: str,
         loose_prefix: str,
-        download_dir: str,
+        patterns: list[str],
         extract_dir: str,
     ) -> list[str]:
-        """Download loose files from the depot and stage them.
+        """Copy matching loose files from the depot to the extract directory.
 
-        Since we can't glob the depot, we download everything under the
-        loose_prefix and then filter locally with our patterns.
-
-        Returns list of extracted relative paths.
+        Returns list of extracted relative paths (relative to loose_prefix).
         """
         if not patterns:
             return []
 
-        dl_path = Path(download_dir)
-        dl_path.mkdir(parents=True, exist_ok=True)
-
-        # Download the entire loose_prefix directory
-        filelist = dl_path / "_filelist_loose.txt"
-        filelist.write_text(f"regex:{re.escape(loose_prefix)}/.*\n")
-
-        cmd = self._build_base_cmd(str(dl_path), str(filelist))
-        self._run_depot_downloader(cmd, timeout=300)
-
-        # Walk downloaded files and filter with our patterns
+        prefix_path = Path(depot_dir) / loose_prefix
         extract_path = Path(extract_dir)
-        prefix_path = dl_path / loose_prefix
         extracted = []
 
         if not prefix_path.exists():
@@ -188,7 +140,6 @@ class SteamDownloader:
         for file in prefix_path.rglob("*"):
             if not file.is_file():
                 continue
-            # Get path relative to the prefix (e.g., resource/localization/file.txt)
             rel = file.relative_to(prefix_path).as_posix()
             if matches_any_pattern(rel, patterns):
                 out_file = extract_path / rel
@@ -196,5 +147,5 @@ class SteamDownloader:
                 shutil.copy2(file, out_file)
                 extracted.append(rel)
 
-        logger.info("Downloaded %d loose files", len(extracted))
+        logger.info("Collected %d loose files from depot", len(extracted))
         return extracted

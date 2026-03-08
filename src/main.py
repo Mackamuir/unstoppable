@@ -99,10 +99,13 @@ def run_update_cycle(
     extract_dir = tempfile.mkdtemp(prefix="unstoppable_")
     detected_build_id = None
     try:
-        download_dir = config.output.depot_cache_dir
+        depot_dir = config.output.depot_cache_dir
 
-        # Check if game has updated by downloading steam.inf
-        build_id = downloader.check_build_id(download_dir, config.steam_inf_path)
+        # Download/update the entire depot
+        downloader.download_depot(depot_dir)
+
+        # Read build ID from the downloaded depot
+        build_id = downloader.get_build_id(depot_dir, config.steam_inf_path)
 
         if build_id == state.build_id:
             logger.debug("No update (build=%s)", build_id)
@@ -110,8 +113,7 @@ def run_update_cycle(
 
         detected_build_id = build_id
 
-        # Read full steam.inf content for inclusion in README
-        steam_inf_file = Path(download_dir) / config.steam_inf_path
+        steam_inf_file = Path(depot_dir) / config.steam_inf_path
         steam_inf_content = steam_inf_file.read_text() if steam_inf_file.exists() else None
 
         logger.info(
@@ -119,29 +121,22 @@ def run_update_cycle(
             state.build_id or "(first run)", build_id,
         )
 
-        # Download and extract VPK files
+        # Extract VPK files from the depot's VPK
         vpk_files = []
         if config.tracked_vpk_files:
-            for _attempt in range(2):
-                try:
-                    vpk_path = downloader.download_vpk(download_dir, config.source_vpk_path)
-                    vpk_files = downloader.extract_vpk_files(
-                        vpk_path, config.tracked_vpk_files, extract_dir,
-                    )
-                    break
-                except OSError:
-                    if _attempt == 1:
-                        raise
-                    logger.warning("VPK corrupted, redownloading...")
+            vpk_path = Path(depot_dir) / config.source_vpk_path
+            if not vpk_path.exists():
+                raise FileNotFoundError(f"Source VPK not found: {vpk_path}")
+            vpk_files = downloader.extract_vpk_files(
+                vpk_path, config.tracked_vpk_files, extract_dir,
+            )
 
-        # Download loose files
+        # Collect loose files from the depot
         loose_files = []
         if config.tracked_loose_files:
-            loose_files = downloader.download_loose_files(
-                config.tracked_loose_files,
-                config.loose_content_prefix,
-                download_dir,
-                extract_dir,
+            loose_files = downloader.collect_loose_files(
+                depot_dir, config.loose_content_prefix,
+                config.tracked_loose_files, extract_dir,
             )
 
         all_paths = set(vpk_files) | set(loose_files)
@@ -150,17 +145,12 @@ def run_update_cycle(
             state.build_id = build_id
             return False
 
-        current_hashes = _compute_file_hashes(extract_dir, all_paths)
         prev_hashes = state.file_hashes or {}
+        current_hashes = _compute_file_hashes(extract_dir, all_paths)
         added, removed, adjusted = _diff_file_hashes(prev_hashes, current_hashes)
 
-        if not added and not removed and not adjusted:
-            logger.info("Tracked files unchanged (build=%s), skipping publish", build_id)
-            state.build_id = build_id
-            return False
-
         logger.info(
-            "Tracked files changed (build=%s): +%d -%d ~%d",
+            "Build %s: tracked files +%d -%d ~%d",
             build_id, len(added), len(removed), len(adjusted),
         )
 
@@ -174,6 +164,8 @@ def run_update_cycle(
             loose_file_count=len(loose_files),
         )
         output_zip = packer.create_zip(output_vpk, zip_name=f"unstoppable_{build_id}.zip")
+        output_vpk.unlink()
+        logger.debug("Deleted VPK after zipping: %s", output_vpk)
         state.set_build(build_id, current_hashes)
 
         logger.info(
