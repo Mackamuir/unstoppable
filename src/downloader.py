@@ -1,4 +1,5 @@
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -46,7 +47,7 @@ class SteamDownloader:
         return cmd
 
     def _run_depot_downloader(self, cmd: list[str], timeout: int = 600) -> str:
-        logger.info("Running DepotDownloader: %s", " ".join(cmd[:6]))
+        logger.info("Running DepotDownloader: %s", " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
             logger.error(
@@ -57,6 +58,37 @@ class SteamDownloader:
                 result.returncode, cmd, result.stdout, result.stderr
             )
         return result.stdout
+
+    @retry(max_attempts=2, base_delay=10.0, exceptions=(subprocess.CalledProcessError, OSError))
+    def get_manifest_gid(self, depot_dir: str) -> str:
+        """Download only the depot manifest and return its GID.
+
+        Much faster than a full depot download — used for lightweight polling.
+        The GID changes whenever the depot is updated, making it a reliable
+        proxy for detecting new game versions without fetching any game files.
+        """
+        Path(depot_dir).mkdir(parents=True, exist_ok=True)
+        cmd = self._build_base_cmd(depot_dir) + ["-manifest-only"]
+        stdout = self._run_depot_downloader(cmd, timeout=120)
+
+        # Primary: parse from stdout line "Manifest 1234567890123456789 @ ..."
+        match = re.search(r"Manifest (\d+)", stdout)
+        if match:
+            gid = match.group(1)
+            logger.debug("Manifest GID from stdout: %s", gid)
+            return gid
+
+        # Fallback: DepotDownloader writes depot_{depot_id}_{gid}.manifest to disk
+        manifest_files = sorted(Path(depot_dir).glob(f"depot_{self.depot_id}_*.manifest"))
+        if manifest_files:
+            gid = manifest_files[-1].stem.split("_")[-1]
+            logger.debug("Manifest GID from file: %s", gid)
+            return gid
+
+        raise RuntimeError(
+            f"Could not determine manifest GID for depot {self.depot_id}. "
+            f"DepotDownloader stdout: {stdout[-200:]}"
+        )
 
     @retry(max_attempts=2, base_delay=10.0, exceptions=(subprocess.CalledProcessError, OSError))
     def download_depot(self, depot_dir: str):

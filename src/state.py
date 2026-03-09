@@ -38,12 +38,23 @@ class State:
         self.save()
 
     @property
+    def manifest_gid(self) -> Optional[str]:
+        return self._data.get("manifest_gid")
+
+    @manifest_gid.setter
+    def manifest_gid(self, value: str):
+        self._data["manifest_gid"] = value
+        self.save()
+
+    @property
     def file_hashes(self) -> Optional[dict]:
         return self._data.get("file_hashes")
 
-    def set_build(self, build_id: str, file_hashes: dict):
-        """Atomically update build_id and file_hashes together."""
+    def set_build(self, build_id: str, file_hashes: dict, manifest_gid: Optional[str] = None):
+        """Atomically update build_id, file_hashes, and optionally manifest_gid together."""
         self._data["build_id"] = build_id
         self._data["file_hashes"] = file_hashes
+        if manifest_gid is not None:
+            self._data["manifest_gid"] = manifest_gid
         self._data["last_updated"] = datetime.now(timezone.utc).isoformat()
         self.save()

@@ -101,14 +101,26 @@ def run_update_cycle(
     try:
         depot_dir = config.output.depot_cache_dir
 
-        # Download/update the entire depot
+        # Fast check: download only the depot manifest (no game files)
+        manifest_gid = downloader.get_manifest_gid(depot_dir)
+        if manifest_gid == state.manifest_gid:
+            logger.debug("No update (manifest_gid=%s)", manifest_gid)
+            return False
+
+        logger.info(
+            "Manifest changed: %s -> %s",
+            state.manifest_gid or "(first run)", manifest_gid,
+        )
+
         downloader.download_depot(depot_dir)
 
         # Read build ID from the downloaded depot
         build_id = downloader.get_build_id(depot_dir, config.steam_inf_path)
 
         if build_id == state.build_id:
-            logger.debug("No update (build=%s)", build_id)
+            # Steam repackaged the depot but the game version didn't change
+            logger.info("Depot repackaged but build unchanged (build=%s), updating manifest_gid", build_id)
+            state.manifest_gid = manifest_gid
             return False
 
         detected_build_id = build_id
@@ -166,7 +178,7 @@ def run_update_cycle(
         output_zip = packer.create_zip(output_vpk, zip_name=f"unstoppable_{build_id}.zip")
         output_vpk.unlink()
         logger.debug("Deleted VPK after zipping: %s", output_vpk)
-        state.set_build(build_id, current_hashes)
+        state.set_build(build_id, current_hashes, manifest_gid=manifest_gid)
 
         logger.info(
             "Update complete: output=%s, zip=%s, vpk_files=%d, loose_files=%d",

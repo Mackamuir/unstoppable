@@ -26,7 +26,7 @@ class UploadResult:
 
 
 class GameBananaPublisher:
-    def __init__(self, username: str, password: str, mod_id: int, section: str = "Mods"):
+    def __init__(self, username: str, password: str, mod_id: int, section: str = "Mod"):
         self.username = username
         self.password = password
         self.mod_id = mod_id

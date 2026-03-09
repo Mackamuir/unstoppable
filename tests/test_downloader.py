@@ -1,7 +1,53 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from src.downloader import SteamDownloader
+
+
+class TestGetManifestGid:
+    def _make_downloader(self):
+        return SteamDownloader(app_id=1422450, depot_id=1422456, branch="public")
+
+    def test_parses_gid_from_stdout(self, tmp_path, monkeypatch):
+        dl = self._make_downloader()
+        monkeypatch.setattr(dl, "_run_depot_downloader", lambda cmd, timeout: (
+            "Got depot key for 1422456\nManifest 8234567890123456789 @ 2024-01-01\n"
+        ))
+        assert dl.get_manifest_gid(str(tmp_path)) == "8234567890123456789"
+
+    def test_falls_back_to_manifest_file(self, tmp_path, monkeypatch):
+        dl = self._make_downloader()
+        monkeypatch.setattr(dl, "_run_depot_downloader", lambda cmd, timeout: "no gid here")
+        (tmp_path / "depot_1422456_9999888877776666.manifest").touch()
+        assert dl.get_manifest_gid(str(tmp_path)) == "9999888877776666"
+
+    def test_stdout_takes_priority_over_file(self, tmp_path, monkeypatch):
+        dl = self._make_downloader()
+        monkeypatch.setattr(dl, "_run_depot_downloader", lambda cmd, timeout: (
+            "Manifest 1111111111111111 @ 2024-01-01\n"
+        ))
+        (tmp_path / "depot_1422456_9999999999999999.manifest").touch()
+        assert dl.get_manifest_gid(str(tmp_path)) == "1111111111111111"
+
+    def test_raises_when_no_gid_available(self, tmp_path, monkeypatch):
+        dl = self._make_downloader()
+        monkeypatch.setattr(dl, "_run_depot_downloader", lambda cmd, timeout: "no useful output")
+        with pytest.raises(RuntimeError, match="manifest GID"):
+            dl.get_manifest_gid(str(tmp_path))
+
+    def test_uses_manifest_only_flag(self, tmp_path, monkeypatch):
+        dl = self._make_downloader()
+        captured = {}
+
+        def fake_run(cmd, timeout):
+            captured["cmd"] = cmd
+            return "Manifest 1234567890123456789 @ 2024-01-01\n"
+
+        monkeypatch.setattr(dl, "_run_depot_downloader", fake_run)
+        dl.get_manifest_gid(str(tmp_path))
+        assert "-manifest-only" in captured["cmd"]
 
 
 class TestGetBuildId:
