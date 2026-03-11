@@ -50,6 +50,15 @@ class State:
     def file_hashes(self) -> Optional[dict]:
         return self._data.get("file_hashes")
 
+    @property
+    def pending_failure_update_id(self) -> Optional[int]:
+        return self._data.get("pending_failure_update_id")
+
+    @pending_failure_update_id.setter
+    def pending_failure_update_id(self, value: Optional[int]):
+        self._data["pending_failure_update_id"] = value
+        self.save()
+
     def set_build(self, build_id: str, file_hashes: dict, manifest_gid: Optional[str] = None):
         """Atomically update build_id, file_hashes, and optionally manifest_gid together."""
         self._data["build_id"] = build_id

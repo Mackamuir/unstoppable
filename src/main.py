@@ -60,9 +60,11 @@ def setup_logging(config: AppConfig):
     root.addHandler(handler)
 
 
-def _try_post_failure_warning(publisher: "GameBananaPublisher", build_id: str):
+def _try_post_failure_warning(publisher: "GameBananaPublisher", build_id: str, state: "State"):
     try:
-        publisher.post_failure_warning(build_id)
+        update_id = publisher.post_failure_warning(build_id)
+        if update_id:
+            state.pending_failure_update_id = update_id
     except Exception:
         logger.exception("Failed to post failure warning to GameBanana")
 
@@ -195,15 +197,22 @@ def run_update_cycle(
                     removed=removed,
                     adjusted=adjusted,
                 )
+                pending_id = state.pending_failure_update_id
+                if pending_id:
+                    try:
+                        publisher.delete_update(pending_id)
+                        state.pending_failure_update_id = None
+                    except Exception:
+                        logger.exception("Failed to delete pending failure warning (update_id=%d)", pending_id)
             except Exception:
                 logger.exception("GameBanana publish failed (VPK still saved locally)")
-                _try_post_failure_warning(publisher, build_id)
+                _try_post_failure_warning(publisher, build_id, state)
 
         return True
 
     except Exception:
         if publisher and detected_build_id:
-            _try_post_failure_warning(publisher, detected_build_id)
+            _try_post_failure_warning(publisher, detected_build_id, state)
         raise
     finally:
         shutil.rmtree(extract_dir, ignore_errors=True)

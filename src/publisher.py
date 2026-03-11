@@ -340,8 +340,8 @@ class GameBananaPublisher:
             )
         logger.info("Edit form submitted successfully: url=%s", final_url)
 
-    def post_failure_warning(self, version: str):
-        """Post a warning update to GameBanana when an update cycle fails."""
+    def post_failure_warning(self, version: str) -> int:
+        """Post a warning update to GameBanana when an update cycle fails. Returns the update _idRow."""
         self.authenticate()
         resp = self._request(
             "POST",
@@ -350,58 +350,39 @@ class GameBananaPublisher:
                 "_aFileRowIds": [],
                 "_sVersion": version,
                 "_sName": f"Warning: update may be broken ({version})",
-                "_aChangeLog": [{"text": "A game update was detected but the automated update failed. The mod may be outdated or broken.", "cat": "Bug"}],
-                "_sText": "<p>Warning: A game update was detected but the automated update process failed. The mod may be outdated or broken until the issue is resolved.</p>",
+                "_sText": "Warning: A game update was detected but the automated update process failed. The mod may be outdated or broken until the issue is resolved.",
             },
         )
         resp.raise_for_status()
-        logger.warning("Posted failure warning to GameBanana: version=%s, response=%s", version, resp.text[:500])
-
-    def post_update(
-        self,
-        upload: UploadResult,
-        version: str,
-        added: list[str],
-        removed: list[str],
-        adjusted: list[str],
-    ):
-        """Post a mod update via the GameBanana API."""
-        changelog = (
-            [{"text": p, "cat": "Addition"} for p in added]
-            + [{"text": p, "cat": "Removal"} for p in removed]
-            + [{"text": p, "cat": "Adjustment"} for p in adjusted]
+        data = resp.json()
+        update_id = data.get("_idRow")
+        logger.warning(
+            "Posted failure warning to GameBanana: version=%s, update_id=%s, response=%s",
+            version, update_id, resp.text[:500],
         )
-        if not changelog:
-            changelog = [{"text": f"Auto-update for build {version}", "cat": "Addition"}]
+        return update_id
 
+    def delete_update(self, update_id: int):
+        """Delete a GameBanana update post (e.g. a previously posted failure warning)."""
         resp = self._request(
-            "POST",
-            f"{GB_API_BASE}/{self.section}/{self.mod_id}/Update",
+            "DELETE",
+            f"{GB_API_BASE}/Update/{update_id}",
             json={
-                "_aFileRowIds": [upload.file_row_id],
-                "_sVersion": version,
-                "_sName": f"Auto-update {version}",
-                "_aChangeLog": changelog,
-                "_sText": f"<p>Auto-update for build {version}</p>",
+                "_idReasonRow": "1",
+                "_bHideReason": True,
+                "_sNotes": "<p>Hidden</p>",
             },
         )
         resp.raise_for_status()
-        logger.info(
-            "GameBanana update posted: version=%s, +%d -%d ~%d, response=%s",
-            version, len(added), len(removed), len(adjusted), resp.text[:500],
-        )
+        logger.info("Deleted GameBanana update: update_id=%d, response=%s", update_id, resp.text[:500])
 
     def publish(
         self,
         zip_path: Path,
         version: str,
         config: AppConfig,
-        added: list[str],
-        removed: list[str],
-        adjusted: list[str],
     ):
         """Authenticate, upload zip, submit the edit form, and post an update."""
         self.authenticate()
         upload = self.upload_zip(zip_path)
         self.post_edit(upload, version, config)
-        self.post_update(upload, version, added=added, removed=removed, adjusted=adjusted)
