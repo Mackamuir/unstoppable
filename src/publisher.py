@@ -376,6 +376,15 @@ class GameBananaPublisher:
         resp.raise_for_status()
         logger.info("Deleted GameBanana update: update_id=%d, response=%s", update_id, resp.text[:500])
 
+    def notify_deadlockmods(self):
+        """Notify deadlockmods.app that the mod has been updated."""
+        url = f"https://api.deadlockmods.app/api/v2/sync/{self.mod_id}"
+        try:
+            resp = self._request("POST", url)
+            logger.info("deadlockmods sync: status=%d, body=%r", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.warning("deadlockmods sync request failed", exc_info=True)
+
     def publish(
         self,
         zip_path: Path,
@@ -386,3 +395,4 @@ class GameBananaPublisher:
         self.authenticate()
         upload = self.upload_zip(zip_path)
         self.post_edit(upload, version, config)
+        self.notify_deadlockmods()
