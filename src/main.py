@@ -79,17 +79,6 @@ def _compute_file_hashes(extract_dir: str, paths: set[str]) -> dict[str, str]:
             hashes[p] = hashlib.sha256(file.read_bytes()).hexdigest()
     return hashes
 
-
-def _diff_file_hashes(
-    prev: dict[str, str], curr: dict[str, str]
-) -> tuple[list[str], list[str], list[str]]:
-    """Return (added, removed, adjusted) sorted file path lists."""
-    added = sorted(p for p in curr if p not in prev)
-    removed = sorted(p for p in prev if p not in curr)
-    adjusted = sorted(p for p in curr if p in prev and curr[p] != prev[p])
-    return added, removed, adjusted
-
-
 def run_update_cycle(
     downloader: SteamDownloader,
     packer: VPKPacker,
@@ -159,13 +148,11 @@ def run_update_cycle(
             state.build_id = build_id
             return False
 
-        prev_hashes = state.file_hashes or {}
         current_hashes = _compute_file_hashes(extract_dir, all_paths)
-        added, removed, adjusted = _diff_file_hashes(prev_hashes, current_hashes)
 
         logger.info(
-            "Build %s: tracked files +%d -%d ~%d",
-            build_id, len(added), len(removed), len(adjusted),
+            "Build %s",
+            build_id
         )
 
         # Pack into mod VPK
@@ -180,7 +167,6 @@ def run_update_cycle(
         output_zip = packer.create_zip(output_vpk, zip_name=f"unstoppable_{build_id}.zip")
         output_vpk.unlink()
         logger.debug("Deleted VPK after zipping: %s", output_vpk)
-        state.set_build(build_id, current_hashes, manifest_gid=manifest_gid)
 
         logger.info(
             "Update complete: output=%s, zip=%s, vpk_files=%d, loose_files=%d",
@@ -193,10 +179,8 @@ def run_update_cycle(
                     zip_path=output_zip,
                     version=build_id,
                     config=config,
-                    added=added,
-                    removed=removed,
-                    adjusted=adjusted,
                 )
+                state.set_build(build_id, current_hashes, manifest_gid=manifest_gid)
                 pending_id = state.pending_failure_update_id
                 if pending_id:
                     try:
@@ -207,6 +191,8 @@ def run_update_cycle(
             except Exception:
                 logger.exception("GameBanana publish failed (VPK still saved locally)")
                 _try_post_failure_warning(publisher, build_id, state)
+        else:
+            state.set_build(build_id, current_hashes, manifest_gid=manifest_gid)
 
         return True
 
@@ -258,6 +244,18 @@ def main():
                 section=gb.section,
             )
             logger.info("GameBanana publishing enabled (mod=%d)", gb.mod_id)
+
+            # Sync local state with the version actually published on GameBanana
+            try:
+                published_version = publisher.get_published_version()
+                if published_version and published_version != state.build_id:
+                    logger.warning(
+                        "Local build_id (%s) does not match GameBanana version (%s), resetting to published version",
+                        state.build_id or "(none)", published_version,
+                    )
+                    state.build_id = published_version
+            except Exception:
+                logger.exception("Failed to check GameBanana published version, continuing with local state")
         else:
             logger.warning("GameBanana enabled but GB_USERNAME/GB_PASSWORD not set: skipping")
 

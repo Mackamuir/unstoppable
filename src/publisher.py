@@ -87,21 +87,18 @@ class GameBananaPublisher:
         logger.info("Auth cookies: %s", dict(self.session.cookies))
         logger.info("Authenticated with GameBanana as %s", self.username)
 
-    def _get_sdpid(self) -> str:
-        """Scrape the edit page to get the session-specific upload token (sdpid)."""
-        edit_url = f"{GB_BASE}/mods/edit/{self.mod_id}"
-        resp = self._request("GET", edit_url, headers={"accept": "text/html"})
+    def get_published_version(self) -> str | None:
+        """Query GameBanana for the currently published version of the mod."""
+        resp = self._request(
+            "GET",
+            f"{GB_API_BASE}/{self.section}/{self.mod_id}",
+            params={"_csvProperties": "_sVersion"},
+        )
         resp.raise_for_status()
-
-        html = resp.text
-        match = re.search(r'["\']sdpid["\']\s*[,:]?\s*["\']([a-f0-9]{32})["\']', html)
-        if match:
-            sdpid = match.group(1)
-            logger.info("Found sdpid: %s", sdpid)
-            return sdpid
-
-        logger.warning("Could not find sdpid in edit page. Snippet: %r", html[:2000])
-        raise RuntimeError("Could not find sdpid in edit page HTML")
+        data = resp.json()
+        version = data.get("_sVersion")
+        logger.info("GameBanana published version: %s", version)
+        return version
 
     def upload_zip(self, zip_path: Path) -> UploadResult:
         """Upload zip file in 1 MB chunks. Returns UploadResult with file row ID and receipt."""
@@ -175,6 +172,22 @@ class GameBananaPublisher:
         if result is None:
             raise RuntimeError("Upload finished but no _idFileRow in response")
         return result
+
+    def _get_sdpid(self) -> str:
+        """Scrape the edit page to get the session-specific upload token (sdpid)."""
+        edit_url = f"{GB_BASE}/mods/edit/{self.mod_id}"
+        resp = self._request("GET", edit_url, headers={"accept": "text/html"})
+        resp.raise_for_status()
+
+        html = resp.text
+        match = re.search(r'["\']sdpid["\']\s*[,:]?\s*["\']([a-f0-9]{32})["\']', html)
+        if match:
+            sdpid = match.group(1)
+            logger.info("Found sdpid: %s", sdpid)
+            return sdpid
+
+        logger.warning("Could not find sdpid in edit page. Snippet: %r", html[:2000])
+        raise RuntimeError("Could not find sdpid in edit page HTML")
 
     def _scrape_edit_page(self) -> dict:
         """GET the edit page and scrape the per-session dynamic fields."""
