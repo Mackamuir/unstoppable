@@ -22,6 +22,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY config.yaml .
 COPY src/ src/
+COPY cli /usr/local/bin/cli
+RUN chmod +x /usr/local/bin/cli
 
 RUN mkdir -p /app/data /app/output /app/staging
 

@@ -1,3 +1,4 @@
+import argparse
 import sys
 import time
 import signal
@@ -13,6 +14,7 @@ from .state import State
 from .downloader import SteamDownloader
 from .packer import VPKPacker
 from .publisher import GameBananaPublisher
+from .github_publisher import GitHubPublisher
 
 logger = logging.getLogger("unstoppable")
 
@@ -61,12 +63,9 @@ def setup_logging(config: AppConfig):
 
 
 def _try_post_failure_warning(publisher: "GameBananaPublisher", build_id: str, state: "State"):
-    try:
-        update_id = publisher.post_failure_warning(build_id)
-        if update_id:
-            state.pending_failure_update_id = update_id
-    except Exception:
-        logger.exception("Failed to post failure warning to GameBanana")
+    # TODO: re-enable after publish testing is complete
+    logger.warning("Failure warning posting is disabled (build_id=%s)", build_id)
+    return
 
 
 def _compute_file_hashes(extract_dir: str, paths: set[str]) -> dict[str, str]:
@@ -85,8 +84,13 @@ def run_update_cycle(
     state: State,
     config: AppConfig,
     publisher: Optional["GameBananaPublisher"] = None,
+    github_publisher: Optional["GitHubPublisher"] = None,
+    force: bool = False,
 ) -> bool:
-    """Execute one update cycle. Returns True if a new VPK was built."""
+    """Execute one update cycle. Returns True if a new VPK was built.
+
+    When force=True, skips manifest_gid and build_id checks.
+    """
     extract_dir = tempfile.mkdtemp(prefix="unstoppable_")
     detected_build_id = None
     try:
@@ -94,7 +98,7 @@ def run_update_cycle(
 
         # Fast check: download only the depot manifest (no game files)
         manifest_gid = downloader.get_manifest_gid(depot_dir)
-        if manifest_gid == state.manifest_gid:
+        if not force and manifest_gid == state.manifest_gid:
             logger.debug("No update (manifest_gid=%s)", manifest_gid)
             return False
 
@@ -108,7 +112,7 @@ def run_update_cycle(
         # Read build ID from the downloaded depot
         build_id = downloader.get_build_id(depot_dir, config.steam_inf_path)
 
-        if build_id == state.build_id:
+        if not force and build_id == state.build_id:
             # Steam repackaged the depot but the game version didn't change
             logger.info("Depot repackaged but build unchanged (build=%s), updating manifest_gid", build_id)
             state.manifest_gid = manifest_gid
@@ -194,6 +198,12 @@ def run_update_cycle(
         else:
             state.set_build(build_id, current_hashes, manifest_gid=manifest_gid)
 
+        if github_publisher:
+            try:
+                github_publisher.publish(zip_path=output_zip, version=build_id)
+            except Exception:
+                logger.exception("GitHub release failed")
+
         return True
 
     except Exception:
@@ -204,21 +214,8 @@ def run_update_cycle(
         shutil.rmtree(extract_dir, ignore_errors=True)
 
 
-def main():
-    config = load_config()
-    setup_logging(config)
-
-    logger.info(
-        "unstoppable starting (app=%d, poll=%ds, vpk_patterns=%d, loose_patterns=%d)",
-        config.steam.app_id,
-        config.steam.poll_interval_seconds,
-        len(config.tracked_vpk_files),
-        len(config.tracked_loose_files),
-    )
-
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
-
+def _init_components(config: AppConfig):
+    """Create shared components (state, downloader, packer, publisher)."""
     state = State(config.state.file)
     downloader = SteamDownloader(
         app_id=config.steam.app_id,
@@ -235,33 +232,59 @@ def main():
 
     publisher = None
     gb = config.gamebanana
-    if gb.enabled:
-        if gb.username and gb.password:
-            publisher = GameBananaPublisher(
-                username=gb.username,
-                password=gb.password,
-                mod_id=gb.mod_id,
-                section=gb.section,
-            )
-            logger.info("GameBanana publishing enabled (mod=%d)", gb.mod_id)
+    if gb.enabled and gb.username and gb.password:
+        publisher = GameBananaPublisher(
+            username=gb.username,
+            password=gb.password,
+            mod_id=gb.mod_id,
+        )
 
-            # Sync local state with the version actually published on GameBanana
-            try:
-                published_version = publisher.get_published_version()
-                if published_version and published_version != state.build_id:
-                    logger.warning(
-                        "Local build_id (%s) does not match GameBanana version (%s), resetting to published version",
-                        state.build_id or "(none)", published_version,
-                    )
-                    state.build_id = published_version
-            except Exception:
-                logger.exception("Failed to check GameBanana published version, continuing with local state")
-        else:
-            logger.warning("GameBanana enabled but GB_USERNAME/GB_PASSWORD not set: skipping")
+    gh_publisher = None
+    gh = config.github
+    if gh.enabled and gh.token and gh.repo:
+        gh_publisher = GitHubPublisher(token=gh.token, repo=gh.repo)
+
+    return state, downloader, packer, publisher, gh_publisher
+
+
+def cmd_run(config: AppConfig):
+    """Run the polling loop (default behavior)."""
+    logger.info(
+        "unstoppable starting (app=%d, poll=%ds, vpk_patterns=%d, loose_patterns=%d)",
+        config.steam.app_id,
+        config.steam.poll_interval_seconds,
+        len(config.tracked_vpk_files),
+        len(config.tracked_loose_files),
+    )
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    state, downloader, packer, publisher, gh_publisher = _init_components(config)
+
+    if publisher:
+        logger.info("GameBanana publishing enabled (mod=%d)", config.gamebanana.mod_id)
+        try:
+            published_version = publisher.get_published_version()
+            if published_version and published_version != state.build_id:
+                logger.warning(
+                    "Local build_id (%s) does not match GameBanana version (%s), resetting to published version",
+                    state.build_id or "(none)", published_version,
+                )
+                state.build_id = published_version
+        except Exception:
+            logger.exception("Failed to check GameBanana published version, continuing with local state")
+    elif config.gamebanana.enabled:
+        logger.warning("GameBanana enabled but GB_USERNAME/GB_PASSWORD not set: skipping")
+
+    if gh_publisher:
+        logger.info("GitHub publishing enabled (repo=%s)", config.github.repo)
+    elif config.github.enabled:
+        logger.warning("GitHub enabled but GITHUB_TOKEN not set: skipping")
 
     while not _shutdown:
         try:
-            run_update_cycle(downloader, packer, state, config, publisher)
+            run_update_cycle(downloader, packer, state, config, publisher, gh_publisher)
         except Exception:
             logger.exception("Error in update cycle, will retry next poll")
 
@@ -271,6 +294,161 @@ def main():
             time.sleep(1)
 
     logger.info("unstoppable shutdown complete")
+
+
+def cmd_update(config: AppConfig, args: argparse.Namespace):
+    """Force a single update cycle, skipping manifest/build checks."""
+    state, downloader, packer, publisher, gh_publisher = _init_components(config)
+    logger.info("Forcing update cycle")
+    built = run_update_cycle(downloader, packer, state, config, publisher, gh_publisher, force=True)
+    if built:
+        print("Update complete: new VPK built and published")
+    else:
+        print("Update cycle ran but no files were found to pack")
+
+
+def _resolve_zip(config: AppConfig, args: argparse.Namespace) -> tuple[Path, str]:
+    """Find the zip to publish and extract its version string."""
+    state = State(config.state.file)
+
+    if args.zip:
+        zip_path = Path(args.zip)
+    else:
+        output_dir = Path(config.output.output_dir)
+        zips = sorted(output_dir.glob("unstoppable_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not zips:
+            print(f"Error: No unstoppable_*.zip files found in {output_dir}")
+            sys.exit(1)
+        zip_path = zips[0]
+
+    if not zip_path.exists():
+        print(f"Error: Zip file not found: {zip_path}")
+        sys.exit(1)
+
+    version = zip_path.stem.removeprefix("unstoppable_") or state.build_id or "unknown"
+    return zip_path, version
+
+
+def cmd_publish_gb(config: AppConfig, args: argparse.Namespace):
+    """Force-publish a zip to GameBanana."""
+    _, _, _, publisher, _ = _init_components(config)
+
+    if not publisher:
+        print("Error: GameBanana publishing is not configured (check config.yaml and GB_USERNAME/GB_PASSWORD)")
+        sys.exit(1)
+
+    zip_path, version = _resolve_zip(config, args)
+    print(f"Publishing {zip_path} (version={version}) to GameBanana mod {config.gamebanana.mod_id}")
+    publisher.publish(zip_path=zip_path, version=version, config=config)
+    print("Publish complete")
+
+
+def cmd_publish_gh(config: AppConfig, args: argparse.Namespace):
+    """Force-publish a zip as a GitHub release."""
+    _, _, _, _, gh_publisher = _init_components(config)
+
+    if not gh_publisher:
+        print("Error: GitHub publishing is not configured (check config.yaml and GITHUB_TOKEN)")
+        sys.exit(1)
+
+    zip_path, version = _resolve_zip(config, args)
+    print(f"Publishing {zip_path} (version={version}) to GitHub {config.github.repo}")
+    gh_publisher.publish(zip_path=zip_path, version=version)
+    print("Publish complete")
+
+
+def cmd_status(config: AppConfig, args: argparse.Namespace):
+    """Show current state."""
+    state = State(config.state.file)
+    data = state._data
+
+    print(f"State file: {config.state.file}")
+    print(f"Build ID:   {data.get('build_id', '(none)')}")
+    print(f"Manifest:   {data.get('manifest_gid', '(none)')}")
+    print(f"Updated:    {data.get('last_updated', '(never)')}")
+
+    pending = data.get("pending_failure_update_id")
+    if pending:
+        print(f"Pending failure warning: update_id={pending}")
+
+    hashes = data.get("file_hashes", {})
+    print(f"Tracked files: {len(hashes)}")
+
+    # Check output directory for zips
+    output_dir = Path(config.output.output_dir)
+    zips = sorted(output_dir.glob("unstoppable_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if zips:
+        latest = zips[0]
+        size_mb = latest.stat().st_size / 1048576
+        print(f"Latest zip: {latest.name} ({size_mb:.2f} MB)")
+    else:
+        print("Latest zip: (none)")
+
+
+def cmd_reset(config: AppConfig, args: argparse.Namespace):
+    """Reset the state file."""
+    if not args.confirm:
+        print("This will clear the build_id, manifest_gid, and file hashes.")
+        print("The next poll cycle will re-download and rebuild everything.")
+        print("Run with --confirm to proceed.")
+        sys.exit(1)
+
+    state_path = Path(config.state.file)
+    if state_path.exists():
+        state_path.unlink()
+        print(f"State file deleted: {state_path}")
+    else:
+        print(f"No state file to delete: {state_path}")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="unstoppable",
+        description="Auto-updating Deadlock vanilla preservation mod",
+    )
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("run", help="Start the polling loop (default)")
+    sub.add_parser("update", help="Force a single update cycle")
+
+    pub_gb = sub.add_parser("publish_gb", help="Force-publish a zip to GameBanana")
+    pub_gb.add_argument("--zip", help="Path to zip file (defaults to latest in output dir)")
+
+    pub_gh = sub.add_parser("publish_gh", help="Force-publish a zip as a GitHub release")
+    pub_gh.add_argument("--zip", help="Path to zip file (defaults to latest in output dir)")
+
+    sub.add_parser("status", help="Show current state and build info")
+
+    reset = sub.add_parser("reset", help="Reset state file to force a fresh run")
+    reset.add_argument("--confirm", action="store_true", help="Confirm the reset")
+
+    return parser
+
+
+def main():
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    setup_logging(config)
+
+    handlers = {
+        "run": lambda: cmd_run(config),
+        "update": lambda: cmd_update(config, args),
+        "publish_gb": lambda: cmd_publish_gb(config, args),
+        "publish_gh": lambda: cmd_publish_gh(config, args),
+        "status": lambda: cmd_status(config, args),
+        "reset": lambda: cmd_reset(config, args),
+        None: lambda: cmd_run(config),
+    }
+
+    handler = handlers.get(args.command)
+    if handler:
+        handler()
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

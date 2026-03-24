@@ -12,10 +12,12 @@ from .config import AppConfig
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 1024 * 1024  # 1 MB - matches observed upload chunks
+CHUNK_SIZE = 1024 * 1024  # 1 MB
 GB_BASE = "https://gamebanana.com"
 GB_API_BASE = "https://gamebanana.com/apiv11"
 GB_UPLOAD_URL = f"{GB_BASE}/responders/jfuare"
+
+DESCRIPTION_PREFIX = "Unstoppable is a mod that holds vanilla files"
 
 
 @dataclass
@@ -26,11 +28,10 @@ class UploadResult:
 
 
 class GameBananaPublisher:
-    def __init__(self, username: str, password: str, mod_id: int, section: str = "Mod"):
+    def __init__(self, username: str, password: str, mod_id: int):
         self.username = username
         self.password = password
         self.mod_id = mod_id
-        self.section = section
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": (
@@ -91,19 +92,72 @@ class GameBananaPublisher:
         """Query GameBanana for the currently published version of the mod."""
         resp = self._request(
             "GET",
-            f"{GB_API_BASE}/{self.section}/{self.mod_id}",
+            f"{GB_API_BASE}/Mod/{self.mod_id}",
             params={"_csvProperties": "_sVersion"},
         )
         resp.raise_for_status()
+        if not resp.text:
+            logger.warning("GameBanana version API returned empty body (status=%d)", resp.status_code)
+            return None
         data = resp.json()
         version = data.get("_sVersion")
         logger.info("GameBanana published version: %s", version)
         return version
 
-    def upload_zip(self, zip_path: Path) -> UploadResult:
-        """Upload zip file in 1 MB chunks. Returns UploadResult with file row ID and receipt."""
-        sdpid = self._get_sdpid()
+    # ── Edit page scraping ────────────────────────────────────────────────
 
+    def _get_edit_page(self) -> str:
+        """Fetch the edit page HTML."""
+        edit_url = f"{GB_BASE}/mods/edit/{self.mod_id}"
+        resp = self._request("GET", edit_url, headers={"accept": "text/html"})
+        resp.raise_for_status()
+        return resp.text
+
+    def _get_upload_fields(self, html: str) -> tuple[str, str, str]:
+        """Extract sdpid, files field hash, and image field hash from the edit page JS.
+
+        The files upload uses /responders/jfuare with ``"sdpid":"<token>"``.
+        The image upload uses /responders/jfu with ``"d":"<token>"``.
+        Returns (sdpid, files_field_name, image_field_name).
+        """
+        # Files field: the _FileInput whose own formData block contains "sdpid"
+        match = re.search(
+            r'#([a-f0-9]{32})_FileInput"\)\.fileupload\(\{\s*formData:\s*\{\s*"sdpid"\s*:\s*"([a-f0-9]{32})"',
+            html, re.DOTALL,
+        )
+        if not match:
+            # Fallback: looser search
+            match = re.search(r'"sdpid"\s*:\s*"([a-f0-9]{32})"', html)
+            if match:
+                sdpid = match.group(1)
+                logger.warning("Found sdpid %s but could not determine field names", sdpid)
+                return sdpid, "", ""
+            raise RuntimeError(
+                f"Could not find sdpid in edit page HTML ({len(html)} chars)"
+            )
+
+        files_field = match.group(1)
+        sdpid = match.group(2)
+
+        # Image field: the _FileInput whose formData block uses "d" (not "sdpid")
+        image_field = ""
+        img_match = re.search(
+            r'#([a-f0-9]{32})_FileInput"\)\.fileupload\(\{\s*formData:\s*\{\s*"d"\s*:',
+            html, re.DOTALL,
+        )
+        if img_match:
+            image_field = img_match.group(1)
+
+        logger.info(
+            "Found sdpid: %s, files field: %s, image field: %s",
+            sdpid, files_field, image_field,
+        )
+        return sdpid, files_field, image_field
+
+    # ── Chunked file upload ───────────────────────────────────────────────
+
+    def upload_zip(self, zip_path: Path, sdpid: str) -> UploadResult:
+        """Upload zip file in 1 MB chunks. Returns UploadResult with file row ID and receipt."""
         total_size = zip_path.stat().st_size
         filename = zip_path.name
         result = None
@@ -173,79 +227,260 @@ class GameBananaPublisher:
             raise RuntimeError("Upload finished but no _idFileRow in response")
         return result
 
-    def _get_sdpid(self) -> str:
-        """Scrape the edit page to get the session-specific upload token (sdpid)."""
-        edit_url = f"{GB_BASE}/mods/edit/{self.mod_id}"
-        resp = self._request("GET", edit_url, headers={"accept": "text/html"})
-        resp.raise_for_status()
+    # ── Dynamic form scraping and submission ──────────────────────────────
 
-        html = resp.text
-        match = re.search(r'["\']sdpid["\']\s*[,:]?\s*["\']([a-f0-9]{32})["\']', html)
+    def _scrape_form(self, html: str) -> list[tuple[str, str]]:
+        """Scrape all form fields from the edit page HTML.
+
+        Returns a list of (name, value) tuples preserving order and duplicates.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        form = soup.find("form")
+        if not form:
+            raise RuntimeError("No <form> found in edit page HTML")
+
+        fields: list[tuple[str, str]] = []
+
+        for el in form.find_all(["input", "textarea", "select"]):
+            name = el.get("name")
+            if not name:
+                continue
+            # Browsers don't submit disabled fields
+            if el.has_attr("disabled"):
+                continue
+
+            if el.name == "textarea":
+                value = el.string or ""
+                fields.append((name, value))
+            elif el.name == "select":
+                if el.has_attr("multiple"):
+                    # Multi-select: add each selected option; skip if none selected
+                    for opt in el.find_all("option", selected=True):
+                        fields.append((name, opt.get("value", "")))
+                else:
+                    selected = el.find("option", selected=True)
+                    value = selected.get("value", "") if selected else ""
+                    fields.append((name, value))
+            elif el.name == "input":
+                input_type = (el.get("type") or "text").lower()
+                if input_type in ("submit", "button", "file", "image"):
+                    continue
+                if input_type == "checkbox":
+                    if el.has_attr("checked"):
+                        fields.append((name, el.get("value", "on")))
+                elif input_type == "radio":
+                    if el.has_attr("checked"):
+                        fields.append((name, el.get("value", "")))
+                else:
+                    fields.append((name, el.get("value", "")))
+
+        logger.info("Scraped %d form fields from edit page", len(fields))
+        return fields
+
+    def _find_ownership_fields(self, html: str) -> list[tuple[str, str]]:
+        """Extract ownership/author fields from the page JS.
+
+        These are JS-generated. The prefix hash appears near 'group_name' or 'author'.
+        """
+        match = re.search(r'var\s+g_sInputName\s*=\s*"([a-f0-9]{32})"', html)
+        if not match:
+            logger.warning("Could not find g_sInputName for ownership fields")
+            return []
+        prefix = match.group(1)
+        logger.info("Found ownership field prefix: %s", prefix)
+        return [
+            (f"{prefix}[1][group_name]", "Developer"),
+            (f"{prefix}[1][author_userids][]", "5279634"),
+            (f"{prefix}[1][author_names][]", "mack.wtf"),
+            (f"{prefix}[1][author_offsite_urls][]", ""),
+            (f"{prefix}[1][author_roles][]", "dude who made it"),
+        ]
+
+    def _find_ticket_ids(self, html: str) -> list[str]:
+        """Find image ticket IDs from the page JS."""
+        ticket_ids = re.findall(
+            r'[Tt]icket[Ii]d["\']?\s*[:=,]\s*["\']([a-f0-9]{32})["\']', html
+        )
+        logger.info("Found %d ticket IDs: %s", len(ticket_ids), ticket_ids)
+        return ticket_ids
+
+    def _find_js_template_fields(self, html: str) -> list[tuple[str, str]]:
+        """Extract form field defaults from JS template strings.
+
+        Some fields (embedded media, alternate sources, requirements) are built
+        by jQuery ``$('<li>...')`` templates and are invisible to BeautifulSoup.
+        """
+        fields: list[tuple[str, str]] = []
+
+        # Embedded media URL input
+        match = re.search(
+            r'name="([a-f0-9]{32})\[\]"[^>]*placeholder="URL or Embed Code', html,
+        )
         if match:
-            sdpid = match.group(1)
-            logger.info("Found sdpid: %s", sdpid)
-            return sdpid
+            fields.append((f"{match.group(1)}[]", ""))
 
-        logger.warning("Could not find sdpid in edit page. Snippet: %r", html[:2000])
-        raise RuntimeError("Could not find sdpid in edit page HTML")
+        # Alternate file sources (URL + Description pair)
+        match = re.search(r'name="([a-f0-9]{32})\[_aUrls\]\[\]"', html)
+        if match:
+            prefix = match.group(1)
+            fields.append((f"{prefix}[_aUrls][]", ""))
+            fields.append((f"{prefix}[_aDescriptions][]", ""))
 
-    def _scrape_edit_page(self) -> dict:
-        """GET the edit page and scrape the per-session dynamic fields."""
+        # Requirements (Description, URL, Action, ActionRecommendation)
+        match = re.search(
+            r'name="([a-f0-9]{32})\[_aDescriptions\]\[\]"[^>]*placeholder="Requirement',
+            html,
+        )
+        if not match:
+            match = re.search(
+                r'placeholder="Requirement[^"]*"[^>]*name="([a-f0-9]{32})\[_aDescriptions\]\[\]"',
+                html,
+            )
+        if match:
+            prefix = match.group(1)
+            fields.append((f"{prefix}[_aDescriptions][]", ""))
+            fields.append((f"{prefix}[_aUrls][]", ""))
+            fields.append((f"{prefix}[_aActions][]", "< select >"))
+            fields.append((f"{prefix}[_aActionRecommendations][]", "< select >"))
+
+        logger.info("Found %d JS template fields", len(fields))
+        return fields
+
+    def post_edit(self, upload: UploadResult, version: str, description: str,
+                  files_json_name: str, image_json_name: str):
+        """Scrape the edit page form, override key fields, and submit.
+
+        The files JSON blob, individual file/image fields, and ownership fields
+        are JS-constructed (not in the HTML form). We extract field names from
+        the page's JS and construct them ourselves.
+        """
+        html = self._get_edit_page()
+        fields = self._scrape_form(html)
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Find the description textarea name by matching content
+        desc_name = None
+        for name, value in fields:
+            if value and DESCRIPTION_PREFIX in value:
+                desc_name = name
+                break
+
+        # Find the version field name — it's the input inside #Version
+        version_section = soup.find(id="Version")
+        version_field_name = None
+        if version_section:
+            version_input = version_section.find("input")
+            if version_input:
+                version_field_name = version_input.get("name")
+        logger.info("Description field: %s, Version field: %s", desc_name, version_field_name)
+
+        # Build file entries — single entry replacing the old file
+        file_entries = [[
+            {"name": "_sDescription", "value": ""},
+            {"name": "_sVersion", "value": str(version)},
+            {"name": "_idFileRow", "value": str(upload.file_row_id)},
+            {"name": "_sUploadReceiptId", "value": upload.upload_receipt_id},
+        ]]
+
+        # Find image ticket IDs from JS
+        ticket_ids = self._find_ticket_ids(html)
+
+        # Build image JSON entries (with real ticket IDs in the blob)
+        image_json_entries = []
+        for i, tid in enumerate(ticket_ids):
+            image_json_entries.append({"name": "_sCaption", "value": "icon" if i == 0 else ""})
+            image_json_entries.append({"name": "_sTicketId", "value": tid})
+
+        # Build individual image fields (empty ticket IDs — browser behaviour)
+        image_individual_fields = []
+        for i in range(len(ticket_ids)):
+            image_individual_fields.append(("_sCaption", "icon" if i == 0 else ""))
+            image_individual_fields.append(("_sTicketId", ""))
+
+        # Find ownership fields (JS-generated)
+        ownership_fields = self._find_ownership_fields(html)
+
+        # Find JS template fields (embedded media, alt sources, requirements)
+        js_template_fields = self._find_js_template_fields(html)
+
+        logger.info("Image JSON field: %s, Files JSON field: %s", image_json_name, files_json_name)
+
+        # Build the form data
+        files_json_value = json.dumps(file_entries)
+        image_json_value = json.dumps(image_json_entries) if image_json_entries else "[]"
+        form_data: list[tuple[str, str]] = []
+
+        # Track where to insert ownership (after the first field with value "true")
+        first_true_index = next(
+            (i for i, (_, v) in enumerate(fields) if v == "true"), None,
+        )
+
+        for i, (name, value) in enumerate(fields):
+            if desc_name and name == desc_name:
+                form_data.append((name, description))
+            elif version_field_name and name == version_field_name:
+                form_data.append((name, str(version)))
+            elif image_json_name and name == image_json_name:
+                # Individual image fields, then the JSON blob
+                for fname, fval in image_individual_fields:
+                    form_data.append((fname, fval))
+                form_data.append((name, image_json_value))
+            elif files_json_name and name == files_json_name:
+                # Individual file fields, then the JSON blob
+                for file_entry in file_entries:
+                    for field in file_entry:
+                        form_data.append((field["name"], field["value"]))
+                form_data.append((name, files_json_value))
+                # JS template fields go right after the files JSON field
+                for tname, tval in js_template_fields:
+                    form_data.append((tname, tval))
+            else:
+                form_data.append((name, value))
+
+            # Insert ownership fields after the first "true" field
+            if first_true_index is not None and i == first_true_index:
+                for oname, ovalue in ownership_fields:
+                    form_data.append((oname, ovalue))
+
+        edit_url = f"{GB_BASE}/mods/edit/{self.mod_id}"
+        logger.info("Submitting edit form with %d fields", len(form_data))
+        for name, value in form_data:
+            logger.debug("  form: %s = %r", name, value[:200] if len(value) > 200 else value)
         resp = self._request(
-            "GET",
-            f"{GB_BASE}/mods/edit/{self.mod_id}",
-            headers={"accept": "text/html"},
+            "POST",
+            edit_url,
+            data=form_data,
+            headers={
+                "origin": GB_BASE,
+                "referer": edit_url,
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "content-type": "application/x-www-form-urlencoded",
+            },
+            allow_redirects=True,
         )
         resp.raise_for_status()
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        logger.info(
+            "Edit POST response: status=%d, url=%s, history=%s, headers=%s, body_len=%d, body=%r",
+            resp.status_code, resp.url,
+            [r.status_code for r in resp.history],
+            dict(resp.headers),
+            len(resp.text),
+            resp.text[:5000],
+        )
 
-        # CSRF: hidden input with a long base64-ish value whose name starts with _
-        csrf_name = csrf_value = None
-        for inp in soup.find_all("input", {"type": "hidden"}):
-            name = inp.get("name", "")
-            value = inp.get("value", "")
-            if name.startswith("_") and len(value) > 50 and re.match(r'^[A-Za-z0-9+/=]+$', value):
-                csrf_name = name
-                csrf_value = value
-                break
+        final_url = resp.url
+        if "edit" in final_url:
+            raise RuntimeError(
+                f"Edit form failed (still on edit URL: {final_url})"
+            )
+        logger.info("Edit form submitted successfully: url=%s", final_url)
 
-        if not csrf_name:
-            raise RuntimeError("Could not find CSRF token in edit page")
-        logger.info("Found CSRF field: name=%r", csrf_name)
+    # ── Description builder ───────────────────────────────────────────────
 
-        # Image ticket IDs - may be in JS/data attrs, not plain inputs.
-        # Try HTML inputs first, then fall back to raw regex on the page source.
-        ticket_ids = [inp.get("value", "") for inp in soup.find_all("input", {"name": "_sTicketId"})]
-        if not ticket_ids:
-            ticket_ids = re.findall(r'[Tt]icket[Ii]d["\']?\s*[:=,]\s*["\']([a-f0-9]{32})["\']', resp.text)
-        logger.info("Found ticket IDs: %s", ticket_ids)
-
-        return {"csrf_name": csrf_name, "csrf_value": csrf_value, "ticket_ids": ticket_ids}
-
-    def post_edit(self, upload: UploadResult, version: str, config: AppConfig):
-        """Submit the mod edit form with the new file row ID."""
-        page = self._scrape_edit_page()
-
-        ticket_ids = page["ticket_ids"]
-        # Pad to 2 in case fewer are found
-        while len(ticket_ids) < 2:
-            ticket_ids.append("")
-
-        image_json = json.dumps([
-            {"name": "_sCaption", "value": "icon"},
-            {"name": "_sTicketId", "value": ticket_ids[0]},
-            {"name": "_sCaption", "value": ""},
-            {"name": "_sTicketId", "value": ticket_ids[1]},
-        ])
-
-        file_json = json.dumps([[
-            {"name": "_sDescription", "value": ""},
-            {"name": "_sVersion", "value": ""},
-            {"name": "_idFileRow", "value": str(upload.file_row_id)},
-            {"name": "_sUploadReceiptId", "value": upload.upload_receipt_id},
-        ]])
-
+    @staticmethod
+    def _build_description(config: AppConfig) -> str:
+        """Build the mod description HTML from config."""
         file_list_items = [
             f"<li>Deadlock/{config.source_vpk_path}:{pattern}</li>"
             for pattern in config.tracked_vpk_files
@@ -255,7 +490,7 @@ class GameBananaPublisher:
         ]
         file_list_html = "<ul>" + "".join(file_list_items) + "</ul>"
 
-        description = (
+        return (
             "Unstoppable is a mod that holds vanilla files so that other mods are unable to overwrite them.<br>"
             "Tons of mods try to all replace the same files, or replace files and break UI.<br><br>"
             "The following files are included in this mod:<br><br>"
@@ -264,101 +499,18 @@ class GameBananaPublisher:
             "This mod should be placed at Deadlock/game/citadel/addons/pak01_dir.vpk, or enabled first in the mod manager. "
             "If you believe it is breaking other mod (lol) then place unstoppable at pak02 and the first mod at pak01.<br><br>"
             "If you have any files you wish for this mod to track, feel free to leave a comment.<br><br>"
-            "In theory this mod will always be current."
+            "In theory this mod will always be current.<br><br>"
+            "Due to the auto-uploader being kinda /unstable/ all releases are also mirrored on <a href='https://github.com/Mackamuir/unstoppable/releases' target='_blank'>GitHub</a>"
         )
 
-        # Build form body. Field order matches the browser capture.
-        # Only CSRF name/value, ticket IDs, image JSON, and file row fields are dynamic.
-        form = [
-            (page["csrf_name"], page["csrf_value"]),
-            ("0de3113420b848a4ad714de755dba0d9", "Unstoppable - Stop mods breaking."),
-            ("5a67d92aeb8ff13269966e4fffb78c3f", "20948"),
-            ("5a67d92aeb8ff13269966e4fffb78c3f_chld", "31710"),
-            ("4d9bc49649acb2ee59b81cfe2a5e13b6", description),
-            ("9e7ff89ddc9e545ad5707a524ea649f1", ""),
-            ("c90417b1da1efc669078ca25a5774986", ""),
-            ("4b6936c0f58e7a99065e846f89b11a29", "false"),
-            ("dada83bb525018a6876422f493d69291", "true"),
-            ("dfc7e6be14e75c67f5219d3cbae51035[1][group_name]", "Developer"),
-            ("dfc7e6be14e75c67f5219d3cbae51035[1][author_userids][]", "5279634"),
-            ("dfc7e6be14e75c67f5219d3cbae51035[1][author_names][]", "mack.wtf"),
-            ("dfc7e6be14e75c67f5219d3cbae51035[1][author_offsite_urls][]", ""),
-            ("dfc7e6be14e75c67f5219d3cbae51035[1][author_roles][]", "dude who made it"),
-            ("e074a85f9a0a6ae7c463898fcbf66b74", "0"),
-            ("9721299755b73e81c70074436231dd62", ""),
-            ("164e7693401f371bfea1b50f2805bcf8[_aOptions][1]", "ask"),
-            ("164e7693401f371bfea1b50f2805bcf8[_aOptions][2]", "ask"),
-            ("164e7693401f371bfea1b50f2805bcf8[_aOptions][3]", "ask"),
-            ("164e7693401f371bfea1b50f2805bcf8[_aOptions][4]", "ask"),
-            ("164e7693401f371bfea1b50f2805bcf8[_aOptions][5]", "ask"),
-            ("164e7693401f371bfea1b50f2805bcf8[_aOptions][6]", "no"),
-            ("164e7693401f371bfea1b50f2805bcf8[_aOptions][7]", "ask"),
-            ("_sCaption", "icon"),
-            ("_sTicketId", ticket_ids[0]),
-            ("_sCaption", ""),
-            ("_sTicketId", ticket_ids[1]),
-            ("7bda043f4bac64379f4bd06dc716d62e", image_json),
-            ("_sDescription", ""),
-            ("_sVersion", str(version)),
-            ("_idFileRow", str(upload.file_row_id)),
-            ("_sUploadReceiptId", upload.upload_receipt_id),
-            ("08feb54ae674cd1a4482aa3f54787d2b", file_json),
-            ("45087a5ee344f0be04e359f2e2dd650e[]", ""),
-            ("f67d32fa56c15016dc4773f4ddfbc1e8[_aUrls][]", ""),
-            ("f67d32fa56c15016dc4773f4ddfbc1e8[_aDescriptions][]", ""),
-            ("9909beb98df30de3d994fd98ae1b4bbc", ""),
-            ("34af0296738f266d2ca374d9a3c332f5[_aDescriptions][]", ""),
-            ("34af0296738f266d2ca374d9a3c332f5[_aUrls][]", ""),
-            ("34af0296738f266d2ca374d9a3c332f5[_aActions][]", "< select >"),
-            ("34af0296738f266d2ca374d9a3c332f5[_aActionRecommendations][]", "< select >"),
-            ("f8f01eb98f600d9abd944986a9fde1b5", "0"),
-            ("f23509dc8b164f4ab0381640b6dbdef3", str(version)),
-            ("575127a72f0cc9f1233a8efbc5d02a3c", "0"),
-            ("75ca75e67e868270e430a8b0d765f8a4", "<a href=\"https://github.com/Mackamuir/unstoppable\">Source</a>"),
-            ("59b606e67af9c221b02fe473073895b4", "0"),
-            ("32d8cec05b843d92bee09510f144eb19", "0"),
-            ("d162a5c2c22c71f7b9ebc56a5efe8f41", "false"),
-            ("7e09d546d64d500c1d5274a47706a3f6", ""),
-            ("d7064f4f22bfe5c9bc9c0d94caaeed8a", "0"),
-            ("185dfdab81e59e022af595b215971f60", "false"),
-            ("2010d19c27afbf21f0ccd49e1b90ebd4", "true"),
-            ("c8c14dd301e119ca29f9a867fcfd41ae", "false"),
-            ("37f580447c23904185db5d3e5dad0170", "true"),
-            ("2397e02062e66bceeb5a44621a32f559", "open"),
-            ("c5cffcac18bba74c651178ab86c9e971", "enabled"),
-            ("702d09c044418852c84adcfbe68d4e4f", ""),
-            ("FormName", "69814328ca00a"),
-        ]
-
-        resp = self._request(
-            "POST",
-            f"{GB_BASE}/mods/edit/{self.mod_id}",
-            data=form,
-            headers={
-                "origin": GB_BASE,
-                "referer": f"{GB_BASE}/mods/edit/{self.mod_id}",
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "content-type": "application/x-www-form-urlencoded",
-            },
-            allow_redirects=True,
-        )
-        resp.raise_for_status()
-
-        final_url = resp.url
-        if "edit" in final_url:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            errors = [e.get_text(strip=True) for e in soup.select(".error, .alert, [class*=error], [class*=alert]")]
-            raise RuntimeError(
-                f"Edit form failed (still on edit URL). errors={errors!r}, body={resp.text[:3000]!r}"
-            )
-        logger.info("Edit form submitted successfully: url=%s", final_url)
+    # ── API-based methods (no browser needed) ─────────────────────────────
 
     def post_failure_warning(self, version: str) -> int:
         """Post a warning update to GameBanana when an update cycle fails. Returns the update _idRow."""
         self.authenticate()
         resp = self._request(
             "POST",
-            f"{GB_API_BASE}/{self.section}/{self.mod_id}/Update",
+            f"{GB_API_BASE}/Mod/{self.mod_id}/Update",
             json={
                 "_aFileRowIds": [],
                 "_sVersion": version,
@@ -398,14 +550,22 @@ class GameBananaPublisher:
         except Exception:
             logger.warning("deadlockmods sync request failed", exc_info=True)
 
+    # ── Main entry point ──────────────────────────────────────────────────
+
     def publish(
         self,
         zip_path: Path,
         version: str,
         config: AppConfig,
     ):
-        """Authenticate, upload zip, submit the edit form, and post an update."""
+        """Authenticate, upload zip, submit the edit form, and notify."""
+        description = self._build_description(config)
         self.authenticate()
-        upload = self.upload_zip(zip_path)
-        self.post_edit(upload, version, config)
+
+        # Fetch edit page once for sdpid, files field name, and image field name
+        html = self._get_edit_page()
+        sdpid, files_json_name, image_json_name = self._get_upload_fields(html)
+
+        upload = self.upload_zip(zip_path, sdpid)
+        self.post_edit(upload, version, description, files_json_name, image_json_name)
         self.notify_deadlockmods()

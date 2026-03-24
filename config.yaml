@@ -24,8 +24,8 @@ steam_inf_path: "game/citadel/steam.inf"
 # Use the actual compiled extensions (_c suffix)
 tracked_vpk_files:
   - "scripts/abilities.vdata_c"
-  - "scripts/heros.vdata_c"
-  - "panorama/styles/popups/panorama/styles/popups/citadel_popup_roster_select.vcss_c"
+  - "scripts/heroes.vdata_c"
+  - "panorama/styles/popups/citadel_popup_roster_select.vcss_c"
 
 # Loose files in the game directory (not inside a VPK)
 # Paths are relative to game/citadel/
@@ -33,6 +33,7 @@ loose_content_prefix: "game/citadel"
 tracked_loose_files:
   - "resource/localization/citadel_gc_hero_names/*.txt"
   - "resource/localization/citadel_gc_mod_names/*.txt"
+  - "resource/localization/citadel_heroes/*.txt"
 
 logging:
   level: "INFO"
@@ -41,4 +42,7 @@ logging:
 gamebanana:
   enabled: false
   mod_id: 000000
-  section: "Mods"
+
+github:
+  enabled: true
+  repo: "Mackamuir/unstoppable"

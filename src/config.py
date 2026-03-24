@@ -8,7 +8,6 @@ from typing import Optional
 class GameBananaConfig:
     enabled: bool
     mod_id: int
-    section: str
     username: Optional[str] = None
     password: Optional[str] = None
 
@@ -43,12 +42,20 @@ class LoggingConfig:
 
 
 @dataclass
+class GitHubConfig:
+    enabled: bool
+    repo: str
+    token: Optional[str] = None
+
+
+@dataclass
 class AppConfig:
     steam: SteamConfig
     output: OutputConfig
     state: StateConfig
     logging: LoggingConfig
     gamebanana: GameBananaConfig
+    github: GitHubConfig
     source_vpk_path: str
     steam_inf_path: str
     tracked_vpk_files: list[str]
@@ -61,13 +68,18 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         raw = yaml.safe_load(f)
 
     gb = raw.get("gamebanana", {})
+    gh = raw.get("github", {})
     return AppConfig(
         gamebanana=GameBananaConfig(
             enabled=gb.get("enabled", False),
             mod_id=gb.get("mod_id", 0),
-            section=gb.get("section", "Mods"),
             username=os.environ.get("GB_USERNAME"),
             password=os.environ.get("GB_PASSWORD"),
+        ),
+        github=GitHubConfig(
+            enabled=gh.get("enabled", False),
+            repo=gh.get("repo", ""),
+            token=os.environ.get("GITHUB_TOKEN"),
         ),
         steam=SteamConfig(
             app_id=raw["steam"]["app_id"],
