@@ -568,4 +568,5 @@ class GameBananaPublisher:
 
         upload = self.upload_zip(zip_path, sdpid)
         self.post_edit(upload, version, description, files_json_name, image_json_name)
+        time.sleep(30) # Wait 30 for cloudflare and caching and stuff to resolve.
         self.notify_deadlockmods()
